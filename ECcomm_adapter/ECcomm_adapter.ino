@@ -26,9 +26,10 @@
     interface, please look at information at
         http://stuartschmitt.com/e_and_c_bus/                      */
 
+#include <cppQueue.h>
 #include "packet.h"
 #include "statuses.h"
-#include <cppQueue.h>
+#include "src/ESP32-A2DP/BluetoothA2DPSink.h"
 
 #define MSG_IS(a, b, c) (msg.Priority() == a && msg.Address() == b && msg.Byte(0) == c)
 #define MSG_IS_EXT(a, b, c, d) (msg.Priority() == a && msg.Address() == b && msg.Byte(0) == c && msg.Byte(1) == d)
@@ -58,6 +59,10 @@ volatile byte module_present_number = 0;
 
 RTC_DATA_ATTR bool battery_disconnected = true;
 
+BluetoothA2DPSink sink;
+
+uint8_t started = 0;
+
 void seek_if_ready() {
   if (seek_parts[0] && seek_parts[1]) {
     playback_time_seconds = seek_parts[0] + (seek_parts[1] * 60);
@@ -67,6 +72,18 @@ void seek_if_ready() {
 }
 
 void setup() {
+  i2s_pin_config_t my_pin_config = {
+    .bck_io_num = 27,
+    .ws_io_num = 12,
+    .data_out_num = 14,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  sink.set_task_core(0);
+  sink.set_auto_reconnect(true);
+  sink.set_pin_config(my_pin_config);
+  sink.start("Buick Regal");
+  started = 1;
+
   gpio_wakeup_enable((gpio_num_t)PIN_RX, GPIO_INTR_HIGH_LEVEL);
   esp_sleep_enable_gpio_wakeup();
   pinMode(PIN_TX, OUTPUT);
@@ -77,6 +94,9 @@ void setup() {
 
 
 void loop() {
+  if (!started) {
+    //sink.start("Buick Regal");
+  }
   bus_state = digitalRead(PIN_RX);
   if (bus_state) {  // If the bus is active, start a read.
     Packet msg(PIN_RX, PIN_TX);
@@ -356,6 +376,8 @@ SkipIfs:
 
   if (!ACC_POWER(power_status) && !playing) {
     Serial.println("Sleeping...");
+    //sink.end();
+    started = 0;
     esp_light_sleep_start();
   }
 
