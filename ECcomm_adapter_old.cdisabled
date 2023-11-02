@@ -1,0 +1,215 @@
+/* ECcomm_adapter - Microcontroller interface for General Motors
+            Entertainment & Comfort serial bus communication.
+
+    Copyright (C) 2016 Stuart V. Schmitt
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+
+    This code assumes a 16 MHz AVR with the E&C bus connected through
+    inverting transistors to digital pins 3 and 5. Direct port registers
+    are used because the overhead associated with Arduino functions
+    digitalRead and digitalWrite result in too many lost or damaged
+    E&C packets. For more information about the bus or the electrical
+    interface, please look at information at
+        http://stuartschmitt.com/e_and_c_bus/                      */
+
+
+#include "packet.h"
+#include "statuses.h"
+
+#define PIN_RX 22
+#define PIN_TX 23
+
+byte mode = 0;              // 0=ASCII, 1=binary; add 2 if an E&C packet is
+// being sent from the computer (ESC + 4 bytes)
+unsigned long timer = 0;    // Timestamp of last E&C packet received/sent
+
+byte bus_state = 0;
+
+// 4 is acc power
+// 2 is OnStar
+// 1 is audio system
+// Use macros from statuses.h
+volatile byte power_status = 0;
+
+volatile byte sent_disc_data = false;
+
+int16_t c = 0;
+
+void setup() {
+  pinMode(PIN_TX, OUTPUT);
+  Serial.begin(115200);       // No need for faster serial; this is 9.6x E&C
+}
+
+
+void loop() {
+  bus_state = digitalRead(PIN_RX);
+  if (bus_state) {      // If the bus is active, start a read.
+    Packet msg(PIN_RX, PIN_TX);
+    msg.Read();
+    if (msg.Sent()) {       // Here, Sent() filters out some false triggers
+      if (mode % 2) {
+        WriteBinary(msg.Unique(), millis() - timer, msg.Incomplete());
+      } else {
+        if (msg.Priority() == 2) {
+          Serial.print("     ");
+        } else if (msg.Priority() == 3) {
+          Serial.print("          ");
+        }
+        WriteText(msg.Unique(), millis() - timer, msg.Incomplete());
+      }
+      if (false && msg.Priority() == 3 && msg.Address() == 30 && msg.Byte(0) == 153) {
+        Packet ack(PIN_RX, PIN_TX);
+        if (msg.Byte(1) == 0) {
+          // Module status
+          // Stuff is backwards, I think
+          if (!sent_disc_data) {
+            //               A--9/7--   IHGFEDCB  JK
+            ack.Send(1, 26, B10001001, B01000000, 0);
+          } else {
+            //               A--9/7--   IHGFEDCB  JK
+            ack.Send(1, 26, B10001001, B01010000, 0);
+          }
+        }
+        if (msg.Byte(1) == 63 || msg.Byte(1) == 3) {
+          // Upload disc data
+          switch (c++) {
+            case -1:
+              // Discs present
+              ack.Send(1, 26, B00011101, B00000100, 0);
+              break;
+            case 0:
+              // Begin disk data (2-26-81/7-1)
+              //                -81/7--
+              ack.Send(2, 26, B11010001, 0, 0);
+              break;
+            case 1:
+              // Disc number
+              //              X-41/7--    YYYYXXX
+              ack.Send(2, 6, B10101001, B00000000, 0);
+              break;
+            case 2:
+              // Total disc time, minutes part
+              //               X-97/7--    YYYYXXX
+              ack.Send(2, 26, B01100001, B01000000, 0);
+              break;
+            case 3:
+              // Total disc time, seconds part
+              //               X-105/7-    YYYYXXX
+              ack.Send(2, 26, B01101001, B01000000, 0);
+              break;
+            case 4:
+              // Total disc time, frames part
+              //               X--25/7-     YYYXXX
+              ack.Send(2, 26, B00011001, B00100000, 0);
+              break;
+          }
+          //               0-------   FEDCBA00
+          //ack.Send(1, 26, B00011101, B00110000, 0);
+          // I think upload disc data, then send disc data
+          //sent_disc_data = true;
+        }
+      Serial.println("Packet sent");
+      }
+      if (msg.Priority() == 1 && msg.Address() == 40 && msg.Byte(0) == 63) {
+        power_status = msg.Byte(1);
+        Serial.printf("\nStatus:\nAccessory %s\nAudio     %s\n", power_status & 4 ? "ON" : "OFF", power_status & 1 ? "ON" : "OFF");
+      }
+      timer = millis();
+    }
+  }
+  if (Serial.available() > 0) {
+    static Packet send(PIN_RX, PIN_TX);
+    switch (Serial.read()) {
+      case 'a':
+        // Mechanism status
+        //                A--9/7--   IHGFEDCB  JK
+        send.Send(1, 26, B10001001, B01000000, 0);
+        break;
+      case 'b':
+        // Disc read status
+        //                A--1/7--   IHGFEDCB  JK
+        send.Send(1, 26, B10000001, B00000010, 0);
+        break;
+      case 'c':
+        // Discs present
+        //                0-29/7-    FEDCBA00  JK
+        send.Send(1, 26, B00011101, B00000100, 0);
+        break;
+    }
+    Serial.println("Packet sent");
+    WriteBinary(send.Unique(), millis() - timer, send.Incomplete());
+  }
+  return;
+}
+
+
+void WriteBinary(unsigned long packet, unsigned long time_gap, byte repaired) {
+  // Send an encoded 12-byte sequence to the computer that contains the time
+  // since the last E&C packet in milliseconds, the flag for incomplete E&C
+  // reception, and the E&C packet contents. The start byte is an ESC, and the
+  // subsequent bytes are limited to ASCII 32-95 in order to keep the tty sane
+  // regardless of the terminal program. The bytes are packed in a method
+  // based on UUencode, which allows six usable bits per byte.
+  //   bits 1-32:   time gap between E&C packets
+  //   bit 33:      incomplete E&C reception flag
+  //   bit 34:      zero
+  //   bits 35-66:  the E&C packet
+  Serial.write((byte) 27);
+  Serial.write(32 + (time_gap & 0x3F));
+  Serial.write(32 + ((time_gap & 0xFC0) >> 6));
+  Serial.write(32 + ((time_gap & 0x3F000) >> 12));
+  Serial.write(32 + ((time_gap & 0xFC0000) >> 18));
+  Serial.write(32 + ((time_gap & 0x3F000000) >> 24));
+  Serial.write(32 + (((time_gap & 0xC0000000) >> 30) + ((repaired & 3) << 2) + ((packet & 3) << 4)));
+  Serial.write(32 + ((packet & 0xFC) >> 2));
+  Serial.write(32 + ((packet & 0x3F00) >> 8));
+  Serial.write(32 + ((packet & 0xFC000) >> 14));
+  Serial.write(32 + ((packet & 0x3F00000) >> 20));
+  Serial.write(32 + ((packet & 0xFC000000) >> 26));
+}
+
+
+void WriteText(unsigned long packet, unsigned long time_gap, byte repaired) {
+  // Simply print the E&C packet to the serial port. This is convenient when
+  // using a simple terminal program to connect to the interface. First, print
+  // the time since the last E&C packet in milliseconds. Then print a ":"
+  // unless the packet was received incomplete; then print a "#". Then print
+  // the E&C packet in PRIORITY-ADDRESS-BYTE1-[BYTE2]-[BYTE3] format.
+  if (time_gap > 10000) {
+    Serial.println();
+  }
+  Serial.print(time_gap);
+  if (repaired)
+    Serial.print('#');
+  else
+    Serial.print(':');
+  Serial.print(' ');
+  Serial.print(packet & 3);
+  Serial.print('-');
+  Serial.print((packet & 252) >> 2);
+  Serial.print('-');
+  Serial.print((packet & 0xFF00) >> 8);
+  if (packet > 0xFFFF) {
+    Serial.print('-');
+    Serial.print((packet & 0xFF0000) >> 16);
+  }
+  if (packet > 0xFFFFFF) {
+    Serial.print('-');
+    Serial.print((packet & 0xFF000000) >> 24);
+  }
+  Serial.println("");
+}
