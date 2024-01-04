@@ -1,4 +1,4 @@
-# Buick Bluetooth Adapter
+# GM Entertainment & Comfort Bluetooth Adapter
 Based largely on findings and code from https://stuartschmitt.com/e_and_c_bus/
 
 I am planning a major re-write, but for now this works as a Bluetooth interface for any car with a GM E&C bus - see the findings from the above website for more information. I have personally tested (and implemented) the solution in my 2003 Buick Regal.
